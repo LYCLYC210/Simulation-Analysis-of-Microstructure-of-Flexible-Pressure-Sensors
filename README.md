@@ -1,0 +1,1 @@
+文件包含用Gemini写的代码，用matlab调研comsol进行仿真

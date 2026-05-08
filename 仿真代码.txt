@@ -1,0 +1,171 @@
+%% === COMSOL 6.3 橡胶压缩 (瞬态研究 完美修复 API 版) ===
+clear all; clc;
+import com.comsol.model.*
+import com.comsol.model.util.*
+
+% --- 1. 参数输入界面 ---
+prompt = {'橡胶宽度 W (mm):', '橡胶基础高度 H (mm):', '顶部圆角半径 R (mm):', ...
+          '橡胶剪切模量 mu (MPa):', '下压速度 v_down (mm/s):', '总仿真时间 (s):'};
+dlgtitle = '设定 瞬态仿真 参数';
+dims = [1 50];
+definput = {'20', '12', '8', '0.333', '1', '3.6'}; 
+answer = inputdlg(prompt, dlgtitle, dims, definput);
+if isempty(answer); return; end
+
+val_W = answer{1}; val_H = answer{2}; val_R = answer{3}; 
+val_mu = answer{4}; val_v = answer{5}; val_time = answer{6};
+
+disp(['⏳ 正在建立瞬态模型 (速度: ', val_v, 'mm/s, 模量: ', val_mu, 'MPa)...']);
+
+% --- 2. 初始化 ---
+try ModelUtil.remove('Model_Sensor_Transient'); catch; end
+model = ModelUtil.create('Model_Sensor_Transient');
+ModelUtil.showProgress(true); 
+
+model.param.set('W', [val_W, '[mm]']);      
+model.param.set('H', [val_H, '[mm]']);      
+model.param.set('R', [val_R, '[mm]']);       
+model.param.set('v_down', [val_v, '[mm/s]']); 
+
+rubber_top_y = str2double(val_H) + str2double(val_R); 
+gap_safe = 0.1; 
+indenter_bottom = rubber_top_y + gap_safe; 
+
+% --- 3. 几何建模 ---
+model.component.create('comp1', true);
+model.component('comp1').geom.create('geom1', 2); 
+model.component('comp1').geom('geom1').lengthUnit('mm');
+
+model.component('comp1').geom('geom1').create('r1', 'Rectangle');
+model.component('comp1').geom('geom1').feature('r1').set('size', {'W', 'H'});
+model.component('comp1').geom('geom1').feature('r1').set('pos', {'-W/2', '0'});
+model.component('comp1').geom('geom1').create('c1', 'Circle');
+model.component('comp1').geom('geom1').feature('c1').set('r', 'R');
+model.component('comp1').geom('geom1').feature('c1').set('pos', {'0', 'H'});
+model.component('comp1').geom('geom1').feature('c1').set('angle', '180');
+model.component('comp1').geom('geom1').create('uni1', 'Union');
+model.component('comp1').geom('geom1').feature('uni1').selection('input').set({'r1', 'c1'});
+model.component('comp1').geom('geom1').feature('uni1').set('intbnd', false);
+
+model.component('comp1').geom('geom1').create('r_indenter', 'Rectangle');
+model.component('comp1').geom('geom1').feature('r_indenter').set('size', {'40[mm]', '2[mm]'});
+model.component('comp1').geom('geom1').feature('r_indenter').set('base', 'center');
+model.component('comp1').geom('geom1').feature('r_indenter').set('pos', {'0', num2str(indenter_bottom + 1)}); 
+
+model.component('comp1').geom('geom1').runPre('fin');
+model.component('comp1').geom('geom1').feature('fin').set('action', 'assembly');
+model.component('comp1').geom('geom1').feature('fin').set('createpairs', false); 
+model.component('comp1').geom('geom1').run('fin');
+
+% --- 4. 选择集 ---
+model.selection.create('sel_indenter_dom', 'Box');
+model.selection('sel_indenter_dom').set('entitydim', 2);
+model.selection('sel_indenter_dom').set('ymin', num2str(indenter_bottom + 0.1));
+
+model.selection.create('sel_indenter_contact', 'Box');
+model.selection('sel_indenter_contact').set('entitydim', 1);
+model.selection('sel_indenter_contact').set('ymin', num2str(indenter_bottom - 0.01));
+model.selection('sel_indenter_contact').set('ymax', num2str(indenter_bottom + 0.01));
+
+model.selection.create('sel_rubber_dom', 'Box');
+model.selection('sel_rubber_dom').set('entitydim', 2);
+model.selection('sel_rubber_dom').set('ymax', num2str(rubber_top_y + 0.01));
+
+model.selection.create('sel_rubber_top', 'Box');
+model.selection('sel_rubber_top').set('entitydim', 1);
+model.selection('sel_rubber_top').set('ymin', num2str(rubber_top_y - 0.5));
+model.selection('sel_rubber_top').set('ymax', num2str(rubber_top_y + 0.01)); 
+
+model.selection.create('sel_rubber_bottom', 'Box');
+model.selection('sel_rubber_bottom').set('entitydim', 1);
+model.selection('sel_rubber_bottom').set('ymax', '0.1');
+
+% --- 5. 几何平滑积分 ---
+disp('📏 正在配置几何空间平滑积分...');
+intop = model.component('comp1').cpl.create('intop1', 'Integration');
+intop.selection.named('sel_rubber_top');
+
+model.component('comp1').variable.create('var1');
+model.component('comp1').variable('var1').set('Total_Force', 'intop1(solid.cnt1.Tn)');
+model.component('comp1').variable('var1').set('Indenter_Y', '20.1[mm] - v_down * t');
+model.component('comp1').variable('var1').set('Rubber_Y', 'Y + v');
+model.component('comp1').variable('var1').set('Overlap', 'Rubber_Y - Indenter_Y');
+model.component('comp1').variable('var1').set('Contact_Area', 'intop1(flc2hs(Overlap, 0.02[mm]))');
+
+% --- 6. 物理场 (时间 t 驱动位移) ---
+model.component('comp1').common.create('pres1', 'PrescribedDeformation');
+model.component('comp1').common('pres1').selection.named('sel_indenter_dom');
+model.component('comp1').common('pres1').set('prescribedDeformation', {'0' '-v_down * t' '0'});
+
+model.component('comp1').pair.create('p1', 'Contact');
+model.component('comp1').pair('p1').source.named('sel_indenter_contact');       
+model.component('comp1').pair('p1').destination.named('sel_rubber_top'); 
+
+model.component('comp1').physics.create('solid', 'SolidMechanics', 'geom1');
+model.component('comp1').physics('solid').selection.named('sel_rubber_dom'); 
+
+mat1 = model.component('comp1').material.create('mat1', 'Common');
+mat1.selection.named('sel_rubber_dom');
+mat1.propertyGroup('def').set('density', '1100'); 
+mat1.propertyGroup.create('NeoHookean', 'NeoHookean', 'Neo-Hookean');
+mat1.propertyGroup('NeoHookean').set('mu', [val_mu, '[MPa]']); 
+
+hmm = model.component('comp1').physics('solid').create('hmm1', 'HyperelasticModel', 2);
+hmm.selection.named('sel_rubber_dom');
+hmm.set('MaterialModel', 'NeoHookean'); 
+hmm.set('Compressibility_NeoHookean', 'Incompressible'); 
+
+model.component('comp1').physics('solid').create('fix1', 'Fixed', 1);
+model.component('comp1').physics('solid').feature('fix1').selection.named('sel_rubber_bottom');
+
+cnt = model.component('comp1').physics('solid').create('cnt1', 'SolidContact', 1);
+cnt.set('pairSelection', 'all'); 
+cnt.set('ContactMethodCtrl', 'Nitsche'); 
+
+% --- 7. 网格 ---
+disp('🕸️ 正在生成局部极细网格...');
+model.component('comp1').mesh.create('mesh1');
+model.component('comp1').mesh('mesh1').create('edge1', 'Edge');
+model.component('comp1').mesh('mesh1').feature('edge1').selection.named('sel_rubber_top');
+model.component('comp1').mesh('mesh1').feature('edge1').create('size1', 'Size');
+model.component('comp1').mesh('mesh1').feature('edge1').feature('size1').set('hmax', '0.05');
+model.component('comp1').mesh('mesh1').create('ftri1', 'FreeTri');
+model.component('comp1').mesh('mesh1').run;
+
+% --- 8. 🌟 瞬态求解器 (已完美修复 API) ---
+std = model.study.create('std1');
+% ✅ 这里的关键词必须是 'Transient'，不能是 'Time'！
+time_std = std.create('time', 'Transient');
+% 时间列表：0 到 最终时间，步长为 0.05s
+time_std.set('tlist', ['range(0[s], 0.05[s], ', val_time, '[s])']); 
+
+disp('🚀 正在启动瞬态求解器 (包含惯性项，耗时可能略长)...');
+try
+    model.study('std1').run; 
+    disp('✅ 瞬态计算成功！');
+catch e
+    disp(['❌ 计算报错: ', e.message]);
+end
+
+% --- 9. 绘图配置 ---
+disp('🎨 正在生成随时间变化的特征图...');
+
+pg1 = model.result.create('pg1', 'PlotGroup2D');
+surf1 = pg1.create('surf1', 'Surface');
+surf1.set('expr', 'solid.mises');
+surf1.create('def1', 'Deform').set('scale', 1);
+
+pg2 = model.result.create('pg2', 'PlotGroup1D');
+pg2.label('Area vs Total Force');
+glob1 = pg2.create('glob1', 'Global');
+glob1.set('expr', {'Contact_Area'});
+glob1.set('xdata', 'expr');
+glob1.set('xdataexpr', 'Total_Force');
+
+pg3 = model.result.create('pg3', 'PlotGroup1D');
+pg3.label('Total Force vs Time');
+glob2 = pg3.create('glob2', 'Global');
+glob2.set('expr', {'Total_Force'});
+
+mphlaunch(model);
+disp('🎉 已打开 COMSOL！可以看动画啦。');
